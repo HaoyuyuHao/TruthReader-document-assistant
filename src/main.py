@@ -103,46 +103,69 @@ def summarize_single_doc(
     return [Document(page_content=summary, metadata=metadata)]
 
 
+
 def upload_file_fn(
         file_list: List[str], 
-        page_size: int = 400, 
-        page_overlap_slider: int = 0, 
-        pre_summary: bool = True, 
-        use_pdf_processor: bool = True,
+        pre_summary: bool = True,
         progress: gr.Progress = gr.Progress(track_tqdm=True)
     ):
     faiss_db = None
     doc_text_dict = {}
-    for file in progress.tqdm(file_list[:max_doc_num]):
+
+    for file in progress.tqdm(file_list):
         file_path = file.name
-        logging.info("Upload file to {}.".format(file_path))
-        file_name = extract_file_name(file_path, embedding_tokenizer, max_len=None)
-        
-        document_text = load_file(file_path, pdf_processer) if use_pdf_processor else load_file(file_path, None)
+        logging.info("Upload JSONL file: {}.".format(file_path))
 
-        summary = summarize_single_doc(title=file_name, document=document_text, url=file_path) if pre_summary else []
-        doc_pages = summary + split_chunks(document_text, chunk_size=page_size, chunk_overlap=page_overlap_slider, url=file_path, title=file_name, tokenizer=embedding_tokenizer)[:max_page_num]
+        try:
+            # 打开 JSONL 文件并逐行读取
+            with open(file_path, 'r', encoding='utf-8') as jsonl_file:
+                for line in jsonl_file:
+                    try:
+                        json_obj = json.loads(line.strip())
+                        
+                        # 确保包含 text 字段
+                        if 'text' not in json_obj:
+                            logging.warning(f"Skipped line in {file_path}: Missing 'text' field.")
+                            continue
 
-        if len(doc_pages) == 0:
+                        text_content = json_obj['text']
+
+                        # 可选的预处理逻辑，例如生成摘要
+                        summary = summarize_single_doc(title=json_obj.get('title', 'Unknown'), 
+                                                       document=text_content, 
+                                                       url=json_obj.get('url', file_path)) if pre_summary else []
+
+                        doc_pages = summary + [text_content]
+
+                        # 将文档添加到数据库
+                        if faiss_db is None:
+                            faiss_db = FAISS.from_documents(doc_pages, embedding=embedding_model, distance_strategy=DistanceStrategy.MAX_INNER_PRODUCT)
+                        else:
+                            faiss_db.add_documents(doc_pages)
+
+                        # 将文档存储到字典
+                        doc_key = json_obj.get('title', f"Document {len(doc_text_dict) + 1}")
+                        doc_text_dict[doc_key] = doc_pages
+
+                    except json.JSONDecodeError:
+                        logging.error(f"Invalid JSON in file {file_path}: {line.strip()}")
+                        continue
+
+        except Exception as e:
+            logging.error(f"Error processing file {file_path}: {e}")
             continue
 
-        if faiss_db is None:
-            faiss_db = FAISS.from_documents(doc_pages, embedding=embedding_model, distance_strategy=DistanceStrategy.MAX_INNER_PRODUCT)
-        else:
-            faiss_db.add_documents(doc_pages)
-
-        doc_text_dict[file_name] = doc_pages
-    
     file_name_list = list(doc_text_dict.keys())
-    
+
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
-    
+
     if len(file_name_list) == 0:
         return gr.Row(), gr.Accordion(label="Preprocessing Parameter", open=True), gr.Tabs(), gr.Dropdown(), gr.Textbox(), gr.Button(), gr.Button(), gr.Button(), gr.Button(), None, None, None
-    
-    return gr.update(visible=False), gr.Accordion(label="Preprocessing Parameter", open=False), gr.Tabs(visible=True, selected="tab-doc-cont"), gr.update(choices=file_name_list, value=file_name_list[-1]), gr.update(placeholder="Input Question", interactive=True), gr.update(interactive=True), gr.update(interactive=True), gr.update(interactive=True), gr.update(interactive=True), doc_text_dict, doc_pages, faiss_db
+
+    return gr.update(visible=False), gr.Accordion(label="Preprocessing Parameter", open=False), gr.Tabs(visible=True, selected="tab-doc-cont"), gr.update(choices=file_name_list, value=file_name_list[-1]), gr.update(placeholder="Input Question", interactive=True), gr.update(interactive=True), gr.update(interactive=True), gr.update(interactive=True), gr.update(interactive=True), doc_text_dict, None, faiss_db
+
 
 
 def clear_file_fn():
@@ -294,22 +317,8 @@ def dochelper_chat_fn(
 ):
     if model_selection not in chat_tokenizer_dict:
         model_selection = "Qwen-14B"
-    chat_tokenizer: AutoTokenizer = chat_tokenizer_dict[model_selection]
-    chat_model: AutoModelForCausalLM = chat_model_dict[model_selection]
 
-    generation_config = {
-        'max_new_tokens': min(max_new_tokens, 1024),
-        'temperature': min(max(0.01, temperature), 1.2),
-        'top_p': min(max(0.01, top_p), 1.0),
-        'top_k': min(max(0, top_k), 64),
-        'num_beams': 1,
-        'do_sample': do_sample,
-        'repetition_penalty': min(max(0, repetition_penalty), 1.2),
-        'no_repeat_ngram_size': min(max(0, no_repeat_ngram_size), 20),
-        'min_new_tokens': 2,
-    }
-
-    # preprocess to remove the citation
+    # Step1: preprocess to remove the citation
     for h_pair in history:
         h_pair[1] = re.sub(r'href="#reference-(\d+)"', '', h_pair[1])
     history = copy.deepcopy(history)
@@ -323,67 +332,8 @@ def dochelper_chat_fn(
     retrieved_documents = [item[0] for item in retrieved_documents_with_score]
     retrieved_documents = sort_documents_by_doc_page(retrieved_documents)
 
-    # Step3: genereate response
-    qa_instruction = generate_qa_prompt(question, retrieved_documents, chat_tokenizer, max_context_len=max_context_len)
-
-    messages = []
-    for user_content, assistant_content in history:
-        messages.append({"role": "user", "content": user_content})
-        messages.append({"role": "assistant", "content": assistant_content})
-    messages = [{"role": "system", "content": "You are a helpful assistant."}] + messages + [{"role": "user", "content": qa_instruction}]
-
-    if "LyChee-6B" == model_selection:
-        input_ids = chat_tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
-            max_length=max_model_len-min(max_new_tokens, 1024),
-            truncation=True,
-        ).to(chat_model.device)
-
-        streamer = TextIteratorStreamer(chat_tokenizer, skip_prompt=True, skip_special_tokens=True)
-
-        generation_kwargs = dict(input_ids=input_ids, streamer=streamer)
-        generation_kwargs.update(generation_config)
-        thread = threading.Thread(target=chat_model.generate, kwargs=generation_kwargs)
-        thread.start()
-
-        generated_text = ""
-        for new_text in streamer:
-            generated_text += new_text
-            if not is_string_endswith_citation(generated_text):
-                yield replace_bracket_references(generated_text, num_reference=len(retrieved_documents))
-        
-    else:
-        port_dict = {"Baichuan-13B": 8000, "Qwen-14B": 8001, "Mixtral-7B*2": 8002,}
-        port = port_dict.get(model_selection, 8001)
-
-        client = OpenAI(
-            api_key="EMPTY",
-            base_url="{chat_model_server}:{port}/v1".format(chat_model_server=chat_model_server, port=port),
-        )
-        streamer = client.chat.completions.create(
-            model="/vllm/EMPTY",
-            messages=messages,
-            stream=True,
-            temperature=temperature if do_sample else 0,
-            top_p=top_p,
-            max_tokens=max_new_tokens,
-            timeout=20,
-        )
-
-        generated_text = ""
-        for chunk in streamer:
-            new_text = chunk.choices[0].delta.content
-            if new_text is not None:
-                generated_text += new_text
-                if not is_string_endswith_citation(generated_text):
-                    yield replace_bracket_references(generated_text, num_reference=len(retrieved_documents))
-
-
-    # Step4: Post-process reponse for reference
-    reference_replace_dict, cited_reference = reorder_reference(generated_text, num_reference=len(retrieved_documents))
+    # Return retrieved documents directly
+    return retrieved_documents
     
     def replace_reference(match):
         old = int(match.group(1))
